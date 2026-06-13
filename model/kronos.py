@@ -709,3 +709,60 @@ class KronosPredictor:
 
         return pred_dfs
 
+    def predict_paths_batch(self, df_list, x_timestamp_list, y_timestamp_list, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=30, verbose=False):
+        """Batched per-sample forecasting (kronos-trader extension).
+
+        Like ``predict_batch`` but returns EVERY sampled path for every series instead of the
+        per-series mean. This lets a backtest evaluate many lookback windows in a single
+        autoregressive pass, which is what makes large-scale win-rate evaluation tractable.
+
+        All series must share the same historical length and pred_len.
+
+        Returns:
+            np.ndarray of shape (num_series, sample_count, pred_len, n_features) in raw price units.
+        """
+        if not (len(df_list) == len(x_timestamp_list) == len(y_timestamp_list)):
+            raise ValueError("df_list, x_timestamp_list, y_timestamp_list must have equal lengths.")
+        num_series = len(df_list)
+
+        x_list, x_stamp_list, y_stamp_list, means, stds, seq_lens, y_lens = [], [], [], [], [], [], []
+        for i in range(num_series):
+            df = df_list[i].copy()
+            if not all(col in df.columns for col in self.price_cols):
+                raise ValueError(f"DataFrame at index {i} is missing price columns {self.price_cols}.")
+            if self.vol_col not in df.columns:
+                df[self.vol_col] = 0.0
+                df[self.amt_vol] = 0.0
+            if self.amt_vol not in df.columns and self.vol_col in df.columns:
+                df[self.amt_vol] = df[self.vol_col] * df[self.price_cols].mean(axis=1)
+            if df[self.price_cols + [self.vol_col, self.amt_vol]].isnull().values.any():
+                raise ValueError(f"DataFrame at index {i} contains NaN values.")
+
+            x = df[self.price_cols + [self.vol_col, self.amt_vol]].values.astype(np.float32)
+            x_stamp = calc_time_stamps(x_timestamp_list[i]).values.astype(np.float32)
+            y_stamp = calc_time_stamps(y_timestamp_list[i]).values.astype(np.float32)
+            if y_stamp.shape[0] != pred_len:
+                raise ValueError(f"y_timestamp[{i}] length {y_stamp.shape[0]} != pred_len {pred_len}.")
+
+            x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
+            x_norm = np.clip((x - x_mean) / (x_std + 1e-5), -self.clip, self.clip)
+
+            x_list.append(x_norm); x_stamp_list.append(x_stamp); y_stamp_list.append(y_stamp)
+            means.append(x_mean); stds.append(x_std)
+            seq_lens.append(x_norm.shape[0]); y_lens.append(y_stamp.shape[0])
+
+        if len(set(seq_lens)) != 1 or len(set(y_lens)) != 1:
+            raise ValueError(f"Batch requires uniform lengths; got seq={seq_lens}, y={y_lens}")
+
+        x_batch = np.stack(x_list, axis=0).astype(np.float32)
+        x_stamp_batch = np.stack(x_stamp_list, axis=0).astype(np.float32)
+        y_stamp_batch = np.stack(y_stamp_list, axis=0).astype(np.float32)
+
+        preds = self.generate(x_batch, x_stamp_batch, y_stamp_batch, pred_len, T, top_k, top_p,
+                              sample_count, verbose, reduce="none")  # (B, sample_count, pred_len, F)
+
+        out = np.empty_like(preds)
+        for i in range(num_series):
+            out[i] = preds[i] * (stds[i] + 1e-5) + means[i]
+        return out
+
